@@ -26,6 +26,7 @@ class OpenAICompatibleProvider(BaseProvider):
             "messages": messages,
             "temperature": self.extra_params.get("temperature", 0.7),
             "max_tokens": self.extra_params.get("max_tokens", 4096),
+            "timeout": 120,
             **kwargs,
         }
         response = await self.client.chat.completions.create(**params)
@@ -38,6 +39,7 @@ class OpenAICompatibleProvider(BaseProvider):
             "temperature": self.extra_params.get("temperature", 0.7),
             "max_tokens": self.extra_params.get("max_tokens", 4096),
             "stream": True,
+            "timeout": 120,
             **kwargs,
         }
         stream = await self.client.chat.completions.create(**params)

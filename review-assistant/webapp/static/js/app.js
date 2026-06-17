@@ -98,39 +98,32 @@ function h(tag, attrs = {}, ...children) {
 
 function renderMarkdown(text) {
   if (!text) return '';
-  // 转义 HTML 防止脚本注入
-  let html = String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-  // Code blocks
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>');
-  // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Bold
-  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  // Headers
-  html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-  // Horizontal rules
-  html = html.replace(/^---$/gm, '<hr>');
-  // Blockquotes
-  html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-  // List items
-  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-  html = html.replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
-  // Line breaks
-  html = html.replace(/\n\n/g, '</p><p>');
-  html = html.replace(/\n/g, '<br>');
-  // Wrap in paragraphs
-  html = '<p>' + html + '</p>';
-  html = html.replace(/<p><\/p>/g, '');
-  html = html.replace(/<p>(\s*<h[1-4]>)/g, '$1');
-  html = html.replace(/(<\/h[1-4]>)\s*<\/p>/g, '$1');
-
-  return '<div class="markdown-content">' + html + '</div>';
+  try {
+    if (window.marked && typeof window.marked.parse === 'function') {
+      var html = window.marked.parse(String(text), {
+        breaks: true,
+        gfm: true,
+      });
+      return '<div class="markdown-content">' + html + '</div>';
+    }
+  } catch (e) {
+    console.warn('marked parser failed, falling back to basic renderer:', e);
+  }
+  // 降级方案：基本渲染
+  var t = String(text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  t = t.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  t = t.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  t = t.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  t = t.replace(/^---$/gm, '<hr>');
+  t = t.replace(/^- (.+)$/gm, '<li>$1</li>');
+  t = t.replace(/\n\n/g, '</p><p>');
+  t = t.replace(/\n/g, '<br>');
+  t = '<p>' + t + '</p>';
+  return '<div class="markdown-content">' + t + '</div>';
 }
 
 function showToast(message, type) {

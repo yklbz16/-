@@ -36,8 +36,18 @@ const API = {
     fd.append('file', file);
     return API.request('POST', '/materials/upload', fd);
   },
+  uploadMaterials: (subject, files) => {
+    const fd = new FormData();
+    fd.append('subject', subject);
+    for (var i = 0; i < files.length; i++) {
+      fd.append('files', files[i]);
+    }
+    return API.request('POST', '/materials/upload', fd);
+  },
   addTextMaterial: (subject, content) => API.request('POST', '/materials/text', { subject, content }),
+  batchAddText: (entries) => API.request('POST', '/materials/batch-text', { entries }),
   parseMaterial: (subject) => API.request('POST', '/materials/parse', { subject, content: '' }),
+  batchParse: (subjects) => API.request('POST', '/materials/batch-parse', { subjects }),
   scanMaterials: () => API.request('POST', '/materials/scan'),
   deleteMaterial: (subject, filename) => API.request('DELETE', `/materials/${encodeURIComponent(subject)}/${encodeURIComponent(filename)}`),
 
@@ -55,6 +65,19 @@ const API = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+
+      // 检查 HTTP 状态码
+      if (!res.ok) {
+        var errText = await res.text().catch(function() { return 'HTTP ' + res.status; });
+        try {
+          var errJson = JSON.parse(errText);
+          onError && onError(errJson.detail || errText);
+        } catch (e) {
+          onError && onError('HTTP ' + res.status + ': ' + errText.slice(0, 200));
+        }
+        return;
+      }
+
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -77,9 +100,14 @@ const API = {
           }
         }
       }
-      onDone && onDone();
+      // 流意外结束，没有收到 [DONE]
+      if (buffer.trim()) {
+        onError && onError('连接意外中断，请重试');
+      } else {
+        onDone && onDone();
+      }
     } catch (e) {
-      onError && onError(e.message);
+      onError && onError(e.message || '网络请求失败');
     }
   },
 
@@ -101,6 +129,8 @@ const API = {
   summaryCompare: (subject, a, b) => API.request('POST', '/summary/compare', { subject, concept_a: a, concept_b: b, mode: 'compare' }),
   summaryCheatsheet: (subject) => API.request('POST', '/summary/cheatsheet', { subject, mode: 'cheatsheet' }),
   summaryChain: (subject, concept) => API.request('POST', '/summary/chain', { subject, start_concept: concept, mode: 'chain' }),
+  summaryGenerateStream: (body) => API.request('POST', '/summary/generate-stream', body),
+  summaryStreamUrl: function() { return this.base + '/summary/generate-stream'; },
 
   // Progress & Schedule
   getProgress: () => API.request('GET', '/progress'),

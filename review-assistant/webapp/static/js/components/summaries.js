@@ -1,16 +1,15 @@
-/* 知识总结页面 */
-
-const SummariesPage = {
+/* 知识总结页面 — 流式生成，实时显示 */
+var SummariesPage = {
   subjects: [],
   currentSubject: '',
   currentMode: '',
   gen: 0,
 
-  render() {
+  render: function() {
     return `
       <div class="page-header">
         <h1>🧠 知识总结</h1>
-        <p>AI帮你将零散知识点串联成体系化结构</p>
+        <p>AI帮你将零散知识点串联成体系化结构 — 实时生成，瞬间可见</p>
       </div>
 
       <div class="panel">
@@ -21,25 +20,25 @@ const SummariesPage = {
       <div id="summary-result"></div>`;
   },
 
-  init(gen, pageName) {
+  init: function(gen, pageName) {
     this.gen = gen;
     this.loadSubjects();
   },
 
-  async loadSubjects() {
-    try {
-      var data = await API.getMaterials();
+  loadSubjects: function() {
+    var self = this;
+    API.getMaterials().then(function(data) {
       var container = document.getElementById('summary-setup');
       if (!container) return;
-      this.subjects = data.subjects.filter(function(s) { return s.file_count > 0; });
-      this.renderSetup();
-    } catch (e) {
+      self.subjects = data.subjects.filter(function(s) { return s.file_count > 0; });
+      self.renderSetup();
+    }).catch(function(e) {
       var container = document.getElementById('summary-setup');
       if (container) container.innerHTML = '<div class="alert alert-error">加载失败: ' + e.message + '</div>';
-    }
+    });
   },
 
-  renderSetup() {
+  renderSetup: function() {
     var container = document.getElementById('summary-setup');
     if (!container) return;
 
@@ -80,10 +79,10 @@ const SummariesPage = {
       </div>
       <div class="mb-2" style="display:flex;gap:10px;flex-wrap:wrap">${modesHtml}</div>
       <div id="summary-extra-params"></div>
-      <button class="btn btn-primary btn-lg mt-2" id="summary-generate-btn" onclick="SummariesPage.generate()" disabled>🚀 生成</button>`;
+      <button class="btn btn-primary btn-lg mt-2" id="summary-generate-btn" onclick="SummariesPage.generateStream()" disabled>🚀 生成</button>`;
   },
 
-  selectMode(mode, el) {
+  selectMode: function(mode, el) {
     var cards = document.querySelectorAll('[id^="summary-mode-"]');
     for (var i = 0; i < cards.length; i++) {
       cards[i].style.borderColor = 'var(--border)';
@@ -108,72 +107,103 @@ const SummariesPage = {
     }
   },
 
-  onSubjectChange() {
+  onSubjectChange: function() {
     var el = document.getElementById('summary-subject');
     if (el) this.currentSubject = el.value;
   },
 
-  async generate() {
+  generateStream: function() {
     var subjectEl = document.getElementById('summary-subject');
     if (!subjectEl) return;
     var subject = subjectEl.value;
     if (!subject) { showToast('请选择科目', 'warning'); return; }
     if (!this.currentMode) { showToast('请选择总结模式', 'warning'); return; }
 
+    var self = this;
+    var mode = this.currentMode;
+
+    // 构建请求体
+    var body = { subject: subject, mode: mode };
+    if (mode === 'chapter') {
+      var chEl = document.getElementById('summary-chapter');
+      body.chapter = (chEl && chEl.value) || '全部';
+    } else if (mode === 'compare') {
+      var aEl = document.getElementById('summary-concept-a');
+      var bEl = document.getElementById('summary-concept-b');
+      var a = (aEl && aEl.value) || '';
+      var b = (bEl && bEl.value) || '';
+      if (!a || !b) { showToast('请填写两个概念', 'warning'); return; }
+      body.concept_a = a;
+      body.concept_b = b;
+    } else if (mode === 'chain') {
+      var cEl = document.getElementById('summary-start-concept');
+      var concept = (cEl && cEl.value) || '';
+      if (!concept) { showToast('请填写起始概念', 'warning'); return; }
+      body.start_concept = concept;
+    }
+
+    // 初始化结果区域
     var resultDiv = document.getElementById('summary-result');
     if (!resultDiv) return;
-    resultDiv.innerHTML = '<div class="panel"><div class="loading-overlay"><span class="spinner"></span> AI 正在生成...</div></div>';
+    var genId = 'gen-' + Date.now();
+    resultDiv.innerHTML = '<div class="panel" id="' + genId + '"><h2>📄 实时生成中...</h2><div class="markdown-content" id="' + genId + '-content" style="min-height:120px;background:var(--bg);border-radius:8px;padding:16px;white-space:pre-wrap;font-size:0.95rem;line-height:1.7"><span class="spinner"></span> AI 正在思考...</div><div id="' + genId + '-status" class="text-sm text-dim mt-2"></div></div>';
 
-    try {
-      var data;
-      var mode = this.currentMode;
-      if (mode === 'chapter') {
-        var chEl = document.getElementById('summary-chapter');
-        var chapter = (chEl && chEl.value) || '全部';
-        data = await API.summaryChapter(subject, chapter);
-      } else if (mode === 'mindmap') {
-        data = await API.summaryMindmap(subject);
-      } else if (mode === 'compare') {
-        var aEl = document.getElementById('summary-concept-a');
-        var bEl = document.getElementById('summary-concept-b');
-        var a = (aEl && aEl.value) || '';
-        var b = (bEl && bEl.value) || '';
-        if (!a || !b) { showToast('请填写两个概念', 'warning'); return; }
-        data = await API.summaryCompare(subject, a, b);
-      } else if (mode === 'cheatsheet') {
-        data = await API.summaryCheatsheet(subject);
-      } else if (mode === 'chain') {
-        var cEl = document.getElementById('summary-start-concept');
-        var concept = (cEl && cEl.value) || '';
-        if (!concept) { showToast('请填写起始概念', 'warning'); return; }
-        data = await API.summaryChain(subject, concept);
-      } else {
-        data = await API.summaryMindmap(subject);
+    var container = document.getElementById(genId);
+    var contentEl = document.getElementById(genId + '-content');
+    var statusEl = document.getElementById(genId + '-status');
+    if (!container || !contentEl) return;
+
+    var fullText = '';
+    var chunkCount = 0;
+    var firstChunk = true;
+
+    API.streamRequest(
+      '/summary/generate-stream',
+      body,
+      // onChunk — 每收到一段文本立即显示
+      function(chunk) {
+        if (chunk.text) {
+          if (firstChunk) {
+            contentEl.textContent = '';
+            firstChunk = false;
+          }
+          fullText += chunk.text;
+          contentEl.textContent = fullText;
+          chunkCount++;
+          if (statusEl) statusEl.textContent = '已生成 ' + chunkCount + ' 片段，' + fullText.length + ' 字...';
+        }
+        if (chunk.saved) {
+          if (statusEl) statusEl.innerHTML = '<span class="text-green">✅ 已保存: summaries/' + chunk.saved + '</span>';
+        }
+      },
+      // onDone — 流式结束，渲染 Markdown + Mermaid
+      function() {
+        if (!container) return;
+        var mermaidHtml = '';
+        var displayContent = fullText;
+        var mermaidMatch = fullText.match(/```mermaid\n([\s\S]*?)```/);
+        if (mermaidMatch) {
+          mermaidHtml = '<div class="mermaid mt-2 mb-2" style="background:#fff;border-radius:8px;padding:16px">' + mermaidMatch[1] + '</div>';
+          displayContent = fullText.replace(/```mermaid\n[\s\S]*?```/, '');
+        }
+
+        container.innerHTML = '<h2>📄 生成结果</h2>' + mermaidHtml + '<div class="markdown-content">' + renderMarkdown(displayContent) + '</div>' + (statusEl ? '<div class="mt-2">' + statusEl.innerHTML + '</div>' : '');
+
+        if (mermaidHtml && window.mermaid) {
+          setTimeout(function() {
+            try { mermaid.run({ querySelector: '.mermaid' }); } catch(e) {}
+          }, 100);
+        }
+
+        // 刷新科目列表以获取更新
+        self.loadSubjects();
+      },
+      // onError
+      function(err) {
+        if (container) {
+          container.innerHTML = '<div class="alert alert-error">生成失败: ' + err + '<br><div class="text-sm mt-2">已生成部分内容:</div><div class="markdown-content mt-2" style="background:var(--bg);padding:12px;border-radius:8px">' + renderMarkdown(fullText) + '</div></div>';
+        }
       }
-
-      var resultDiv2 = document.getElementById('summary-result');
-      if (!resultDiv2) return;
-
-      var content = data.content;
-      var mermaidHtml = '';
-      var mermaidMatch = content.match(/```mermaid\n([\s\S]*?)```/);
-      if (mermaidMatch) {
-        mermaidHtml = '<div class="mermaid mt-2 mb-2" style="background:#fff;border-radius:8px;padding:16px">' + mermaidMatch[1] + '</div>';
-        content = content.replace(/```mermaid\n[\s\S]*?```/, '');
-      }
-
-      var savedNote = data.filename ? '<div class="mt-2 text-sm text-dim">已保存至: summaries/' + data.filename + '</div>' : '';
-
-      resultDiv2.innerHTML = '<div class="panel"><h2>📄 生成结果</h2>' + mermaidHtml + '<div class="markdown-content">' + renderMarkdown(content) + '</div>' + savedNote + '</div>';
-
-      if (mermaidHtml && window.mermaid) {
-        setTimeout(function() {
-          try { mermaid.run({ querySelector: '.mermaid' }); } catch(e) {}
-        }, 100);
-      }
-    } catch (e) {
-      var resultDiv3 = document.getElementById('summary-result');
-      if (resultDiv3) resultDiv3.innerHTML = '<div class="alert alert-error">生成失败: ' + e.message + '</div>';
-    }
+    );
   },
 };

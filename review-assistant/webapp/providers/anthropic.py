@@ -46,13 +46,13 @@ class AnthropicProvider(BaseProvider):
             "messages": converted,
             "max_tokens": self.extra_params.get("max_tokens", 4096),
             "temperature": self.extra_params.get("temperature", 0.7),
+            "timeout": 120,
             **kwargs,
         }
         if system:
             params["system"] = system
 
         response = await self.client.messages.create(**params)
-        # Anthropic 返回 content 列表，取第一个 text block
         for block in response.content:
             if block.type == "text":
                 return block.text
@@ -67,6 +67,7 @@ class AnthropicProvider(BaseProvider):
             "max_tokens": self.extra_params.get("max_tokens", 4096),
             "temperature": self.extra_params.get("temperature", 0.7),
             "stream": True,
+            "timeout": 120,
             **kwargs,
         }
         if system:

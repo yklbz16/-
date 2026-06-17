@@ -2,13 +2,22 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional
+
+# 确保无论从哪个目录启动都能正确导入模块
+_webapp_dir = Path(__file__).parent
+if str(_webapp_dir) not in sys.path:
+    sys.path.insert(0, str(_webapp_dir))
+
+from typing import List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+from datetime import date
 
 from providers.factory import (
     create_provider, load_config, save_config,
@@ -36,6 +45,16 @@ class ConfigUpdate(BaseModel):
 class MaterialText(BaseModel):
     subject: str
     content: str
+
+class BatchTextEntry(BaseModel):
+    subject: str
+    content: str
+
+class BatchText(BaseModel):
+    entries: list[BatchTextEntry]
+
+class BatchSubjects(BaseModel):
+    subjects: list[str]
 
 class QuizGenerate(BaseModel):
     subject: str
@@ -132,17 +151,36 @@ async def api_list_materials(subject: str = ""):
 @app.post("/api/materials/upload")
 async def api_upload_material(
     subject: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(None),
+    files: List[UploadFile] = File(None),
 ):
-    """上传资料文件"""
-    content = await file.read()
-    filepath = store.save_material_file(subject, file.filename, content)
+    """上传资料文件（支持单文件或多文件批量上传）"""
+    all_files = []
+    if files:
+        all_files = files
+    elif file:
+        all_files = [file]
+
+    if not all_files:
+        raise HTTPException(400, "请选择至少一个文件")
+
+    results = []
+    for f in all_files:
+        content = await f.read()
+        if not content:
+            continue
+        store.save_material_file(subject, f.filename, content)
+        results.append({"filename": f.filename, "size": len(content)})
+
+    if not results:
+        raise HTTPException(400, "没有有效文件被上传")
+
     return {
         "ok": True,
         "subject": subject,
-        "filename": file.filename,
-        "size": len(content),
-        "message": f"已添加资料: {file.filename}",
+        "files": results,
+        "count": len(results),
+        "message": f"已添加 {len(results)} 份资料" if len(results) > 1 else f"已添加资料: {results[0]['filename']}",
     }
 
 @app.post("/api/materials/text")
@@ -156,36 +194,169 @@ async def api_add_text(data: MaterialText):
         "message": f"已保存文本资料: {filepath.name}",
     }
 
+@app.post("/api/materials/batch-text")
+async def api_batch_add_text(data: BatchText):
+    """批量粘贴文本资料（多个科目+内容对）"""
+    if not data.entries:
+        raise HTTPException(400, "请提供至少一条资料")
+
+    results = []
+    for i, entry in enumerate(data.entries):
+        if not entry.subject or not entry.content:
+            continue
+        filepath = store.save_material_text(entry.subject, entry.content)
+        results.append({
+            "subject": entry.subject,
+            "filename": filepath.name,
+            "content_len": len(entry.content),
+        })
+
+    return {
+        "ok": True,
+        "count": len(results),
+        "results": results,
+        "message": f"已批量添加 {len(results)} 条资料",
+    }
+
+@app.post("/api/materials/batch-parse")
+async def api_batch_parse(data: BatchSubjects):
+    """批量增量解析多个科目的资料（只解析新文件）"""
+    if not data.subjects:
+        raise HTTPException(400, "请提供至少一个科目")
+
+    config = load_config()
+    provider = create_provider(config)
+    results = []
+
+    for subject in data.subjects:
+        new_text, new_files = store.read_new_files_text(subject)
+        if not new_files:
+            results.append({"subject": subject, "ok": True, "message": "无新文件，跳过", "new_files": []})
+            continue
+
+        existing_knowledge = store.read_knowledge(subject) or ""
+        today_str = date.today().isoformat()
+
+        if existing_knowledge:
+            prompt = f"""你是一位资深教师。以下是「{subject}」科目**已有的知识点摘要**：
+
+{existing_knowledge[:2000]}
+
+---
+请分析以下**新添加的资料**，提取**新增的知识点**（不要重复已有内容）：
+
+{new_text[:50000]}
+
+请以 Markdown 格式输出，只列出新增的内容：
+1. 新发现的章节/主题
+2. 每个新主题的核心概念、定义、公式
+3. 可出题的知识点清单（每行格式: - 知识点名称：一句话描述）"""
+        else:
+            prompt = f"""你是一位资深教师。请分析以下学习资料，提取知识点结构。
+
+资料内容：
+{new_text[:50000]}
+
+请生成一份知识点摘要：
+1. 科目名称
+2. 章节/主题列表
+3. 每个章节的核心概念、定义、公式（如适用）
+4. 可出题的知识点清单（每行格式: - 知识点名称：一句话描述）
+
+用中文输出，格式为 Markdown。"""
+
+        try:
+            knowledge = await provider.chat([
+                {"role": "system", "content": "你是一位资深教师，擅长分析整理学科知识点。请用 Markdown 格式输出，知识点清单中每行以 '- ' 开头。"},
+                {"role": "user", "content": prompt}
+            ])
+            if existing_knowledge:
+                merged = existing_knowledge + "\n\n---\n## 新增内容 (" + today_str + ")\n\n" + knowledge
+            else:
+                merged = knowledge
+            store.save_knowledge(subject, merged)
+            store.mark_files_parsed(subject, new_files)
+            results.append({"subject": subject, "ok": True, "message": f"已解析 {len(new_files)} 个新文件", "new_files": new_files})
+        except Exception as e:
+            results.append({"subject": subject, "ok": False, "error": str(e), "new_files": new_files})
+
+    return {
+        "ok": True,
+        "total": len(results),
+        "succeeded": sum(1 for r in results if r["ok"]),
+        "failed": sum(1 for r in results if not r["ok"]),
+        "results": results,
+    }
+
 @app.post("/api/materials/parse")
 async def api_parse_material(data: MaterialText):
-    """用 LLM 解析资料，生成知识点摘要"""
-    all_text = store.read_all_materials_text(data.subject)
-    if not all_text:
-        raise HTTPException(404, f"科目 '{data.subject}' 没有资料")
+    """用 LLM 增量解析资料——只解析新文件，已有知识点不重跑"""
+    subject = data.subject
+
+    # 检查是否有新文件
+    new_text, new_files = store.read_new_files_text(subject)
+    if not new_files:
+        # 没有新文件，返回已有知识点
+        existing = store.read_knowledge(subject)
+        return {
+            "ok": True,
+            "knowledge": existing or "",
+            "message": "所有文件已是最新，无需重新解析",
+            "new_files": [],
+        }
 
     config = load_config()
     provider = create_provider(config)
 
-    prompt = f"""你是一位资深教师。请分析以下学习资料，提取知识点结构。
+    # 读取已有知识点作为上下文
+    existing_knowledge = store.read_knowledge(subject) or ""
+
+    if existing_knowledge:
+        prompt = f"""你是一位资深教师。以下是「{subject}」科目**已有的知识点摘要**：
+
+{existing_knowledge[:2000]}
+
+---
+请分析以下**新添加的资料**，提取**新增的知识点**（不要重复已有内容）：
+
+{new_text[:50000]}
+
+请以 Markdown 格式输出，只列出新增的内容：
+1. 新发现的章节/主题
+2. 每个新主题的核心概念、定义、公式
+3. 可出题的知识点清单（每行格式: - 知识点名称：一句话描述）"""
+    else:
+        prompt = f"""你是一位资深教师。请分析以下学习资料，提取知识点结构。
 
 资料内容：
-{all_text[:8000]}
+{new_text[:50000]}
 
-请生成一份知识点摘要，包含：
+请生成一份知识点摘要：
 1. 科目名称
 2. 章节/主题列表
 3. 每个章节的核心概念、定义、公式（如适用）
-4. 可出题的知识点清单（每个知识点一行，用 - 开头）
+4. 可出题的知识点清单（每行格式: - 知识点名称：一句话描述）
 
 用中文输出，格式为 Markdown。"""
 
     try:
         knowledge = await provider.chat([
-            {"role": "system", "content": "你是一位资深教师，擅长分析整理学科知识点。"},
+            {"role": "system", "content": "你是一位资深教师，擅长分析整理学科知识点。请用 Markdown 格式输出，知识点清单中每行以 '- ' 开头。"},
             {"role": "user", "content": prompt}
         ])
-        store.save_knowledge(data.subject, knowledge)
-        return {"ok": True, "knowledge": knowledge}
+        # 合并已有知识点和新知识点
+        if existing_knowledge:
+            merged = existing_knowledge + "\n\n---\n\n## 新增内容 (" + str(date.today()) + ")\n\n" + knowledge
+        else:
+            merged = knowledge
+        store.save_knowledge(subject, merged)
+        store.mark_files_parsed(subject, new_files)
+        return {
+            "ok": True,
+            "knowledge": merged,
+            "new_files": new_files,
+            "message": f"已解析 {len(new_files)} 个新文件",
+        }
     except Exception as e:
         raise HTTPException(500, f"解析失败: {str(e)}")
 
@@ -529,6 +700,82 @@ async def api_clear_error(error_id: str):
 
 
 # ========== 总结 API ==========
+
+# --- 流式总结辅助函数 ---
+
+def _build_summary_prompt(data, all_text):
+    """构建总结提示词，返回 (prompt, system_prompt, filename)"""
+    errors = store.list_errors(subject=data.subject)
+    error_lines = "\n".join([f'- {e["topic"]}: {e["summary"]}' for e in errors[:10]]) if errors else "暂无"
+
+    mode = data.mode
+    if mode == "chapter":
+        return (
+            f"请为科目「{data.subject}」的章节「{data.chapter}」生成结构化总结。\n\n## 资料内容\n{all_text[:50000]}\n\n## 错题记录\n{error_lines}\n\n请包含：1.核心概念 2.关键公式/定理 3.常见考点 4.易错提醒。用中文 Markdown 输出。",
+            "你是资深教师，擅长做章节知识总结。",
+            f"{data.subject}-{data.chapter}-summary.md"
+        )
+    elif mode == "mindmap":
+        return (
+            f"请为科目「{data.subject}」生成 Mermaid mindmap 格式的思维导图。\n\n## 资料内容\n{all_text[:50000]}\n\n要求：使用 mindmap 语法，层级清晰，覆盖所有章节。直接输出 Mermaid 代码块，用中文。",
+            "你擅长用 Mermaid 绘制思维导图。",
+            f"{data.subject}-mindmap.md"
+        )
+    elif mode == "compare":
+        return (
+            f"请对比以下两个概念：{data.concept_a} vs {data.concept_b}\n\n## 参考资料\n{all_text[:50000]}\n\n请生成对比表格，包含：定义、关键区别、适用场景、常见混淆点。附1-2道辨析题。用中文 Markdown 输出。",
+            "你是资深教师，擅长概念辨析。",
+            ""
+        )
+    elif mode == "cheatsheet":
+        return (
+            f"请为科目「{data.subject}」生成一份考前速记单（A4纸1页的量）。\n\n## 资料内容\n{all_text[:50000]}\n\n## 高频错题知识点\n{error_lines}\n\n要求：只保留最高频考点、核心公式、关键区别，布局紧凑适合考前浏览，用表格列表等紧凑格式，标出易错点。用中文 Markdown 输出。",
+            "你是资深教师，擅长制作考前速记单。",
+            f"{data.subject}-cheatsheet.md"
+        )
+    elif mode == "chain":
+        return (
+            f"请从概念「{data.start_concept}」出发，沿着逻辑关系串联相关知识。\n\n## 资料内容\n{all_text[:50000]}\n\n要求：生成一条知识链 A→B→C→D，每步解释关联原因，帮助建立体系化理解。用中文 Markdown 输出（可用 Mermaid flowchart）。",
+            "你是资深教师，擅长串联知识点建立体系。",
+            ""
+        )
+    return ("", "", "")
+
+
+@app.post("/api/summary/generate-stream")
+async def api_summary_generate_stream(data: SummaryRequest):
+    """流式生成知识总结（SSE），所有模式统一入口——实时推送到前端"""
+    all_text = store.read_all_materials_text(data.subject)
+    if not all_text and data.mode not in ("compare", "chain"):
+        raise HTTPException(404, "没有资料")
+
+    prompt, system_prompt, filename = _build_summary_prompt(data, all_text or "")
+    if not prompt:
+        raise HTTPException(400, f"未知模式: {data.mode}")
+
+    config = load_config()
+    provider = create_provider(config)
+
+    async def generate():
+        full_text = ""
+        try:
+            async for chunk in provider.chat_stream([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]):
+                full_text += chunk
+                yield f"data: {json.dumps({'text': chunk})}\n\n"
+            # 保存生成结果
+            if filename:
+                subdir = "mindmaps" if data.mode == "mindmap" else ("cheat-sheets" if data.mode == "cheatsheet" else "")
+                store.save_summary(subdir, filename, full_text)
+            yield f"data: {json.dumps({'saved': filename})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
 
 @app.post("/api/summary/chapter")
 async def api_summary_chapter(data: SummaryRequest):

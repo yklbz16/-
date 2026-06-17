@@ -8,6 +8,52 @@ from datetime import date
 from typing import Optional
 
 
+def _extract_pptx_text(filepath: Path) -> str:
+    """从 .pptx 文件提取文本"""
+    try:
+        from pptx import Presentation
+        prs = Presentation(str(filepath))
+        texts = []
+        for slide_num, slide in enumerate(prs.slides, 1):
+            slide_texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        t = para.text.strip()
+                        if t:
+                            slide_texts.append(t)
+                if shape.has_table:
+                    table = shape.table
+                    for row in table.rows:
+                        row_texts = []
+                        for cell in row.cells:
+                            ct = cell.text.strip()
+                            if ct:
+                                row_texts.append(ct)
+                        if row_texts:
+                            slide_texts.append(' | '.join(row_texts))
+            if slide_texts:
+                texts.append(f"## 幻灯片 {slide_num}\n" + '\n'.join(slide_texts))
+        return '\n\n'.join(texts) if texts else ""
+    except Exception as e:
+        return f"[PPTX 解析失败: {e}]"
+
+
+def _extract_pdf_text(filepath: Path) -> str:
+    """从 .pdf 文件提取文本"""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(filepath))
+        texts = []
+        for page_num, page in enumerate(reader.pages, 1):
+            t = page.extract_text()
+            if t and t.strip():
+                texts.append(f"## 第 {page_num} 页\n{t.strip()}")
+        return '\n\n'.join(texts) if texts else ""
+    except Exception as e:
+        return f"[PDF 解析失败: {e}]"
+
+
 class FileStore:
     """复习助手文件存储管理"""
 
@@ -43,14 +89,17 @@ class FileStore:
                 files = []
                 knowledge_count = 0
                 for f in sorted(subject_dir.iterdir()):
-                    if f.suffix in (".md", ".txt", ".pdf"):
+                    if f.name.startswith("."):
+                        # 知识点摘要文件需要单独统计
+                        if f.name == ".knowledge.md":
+                            knowledge_count = self._count_knowledge_items(f)
+                        continue
+                    if f.suffix in (".md", ".txt", ".pdf", ".pptx"):
                         files.append({
                             "name": f.name,
                             "size": f.stat().st_size,
                             "type": f.suffix,
                         })
-                    if f.name.endswith(".knowledge.md"):
-                        knowledge_count = self._count_knowledge_items(f)
 
                 subjects.append({
                     "name": subject_dir.name,
@@ -113,15 +162,97 @@ class FileStore:
         return None
 
     def read_all_materials_text(self, subject: str) -> str:
-        """读取某科目的全部资料文本"""
+        """读取某科目的全部资料文本（含 .md / .txt / .pptx / .pdf）"""
         d = self.materials_dir / subject
         if not d.exists():
             return ""
         texts = []
         for f in sorted(d.iterdir()):
-            if f.suffix in (".md", ".txt") and not f.name.startswith("."):
+            if f.name.startswith("."):
+                continue
+            if f.suffix in (".md", ".txt"):
                 texts.append(f"## 文件: {f.name}\n\n{f.read_text(encoding='utf-8')}")
+            elif f.suffix == ".pptx":
+                extracted = _extract_pptx_text(f)
+                if extracted:
+                    texts.append(f"## 文件: {f.name} (PPT 演示文稿)\n\n{extracted}")
+            elif f.suffix == ".pdf":
+                extracted = _extract_pdf_text(f)
+                if extracted:
+                    texts.append(f"## 文件: {f.name} (PDF 文档)\n\n{extracted}")
         return "\n\n---\n\n".join(texts)
+
+    def get_new_files(self, subject: str) -> list[str]:
+        """获取科目中尚未解析的新文件列表（对比 .parsed_tracker）"""
+        d = self.materials_dir / subject
+        if not d.exists():
+            return []
+        tracker_path = d / ".parsed_tracker"
+        parsed_names = set()
+        if tracker_path.exists():
+            parsed_names = set(tracker_path.read_text(encoding="utf-8").strip().split("\n"))
+        all_files = []
+        for f in sorted(d.iterdir()):
+            if f.name.startswith("."):
+                continue
+            if f.suffix in (".md", ".txt", ".pdf", ".pptx"):
+                all_files.append(f.name)
+        return [fn for fn in all_files if fn not in parsed_names]
+
+    def read_new_files_text(self, subject: str) -> tuple[str, list[str]]:
+        """只读取科目中新增文件的文本，返回 (文本, 新文件名列表)"""
+        d = self.materials_dir / subject
+        if not d.exists():
+            return "", []
+        tracker_path = d / ".parsed_tracker"
+        all_files = []
+        for f in sorted(d.iterdir()):
+            if f.name.startswith("."):
+                continue
+            if f.suffix in (".md", ".txt", ".pdf", ".pptx"):
+                all_files.append(f.name)
+
+        if tracker_path.exists():
+            parsed_names = set(tracker_path.read_text(encoding="utf-8").strip().split("\n"))
+        elif (d / ".knowledge.md").exists():
+            # 已有解析结果但无 tracker，将全部文件视为已解析
+            tracker_path.write_text("\n".join(sorted(all_files)), encoding="utf-8")
+            return "", []
+        else:
+            # 全新科目，所有文件都是新的
+            parsed_names = set()
+
+        new_files = [fn for fn in all_files if fn not in parsed_names]
+        if not new_files:
+            return "", []
+
+        texts = []
+        for f in sorted(d.iterdir()):
+            if f.name.startswith("."):
+                continue
+            if f.suffix in (".md", ".txt", ".pdf", ".pptx") and f.name in new_files:
+                if f.suffix in (".md", ".txt"):
+                    texts.append(f"## 文件: {f.name}\n\n{f.read_text(encoding='utf-8')}")
+                elif f.suffix == ".pptx":
+                    extracted = _extract_pptx_text(f)
+                    if extracted:
+                        texts.append(f"## 文件: {f.name} (PPT)\n\n{extracted}")
+                elif f.suffix == ".pdf":
+                    extracted = _extract_pdf_text(f)
+                    if extracted:
+                        texts.append(f"## 文件: {f.name} (PDF)\n\n{extracted}")
+        return "\n\n---\n\n".join(texts), new_files
+
+    def mark_files_parsed(self, subject: str, filenames: list[str]) -> None:
+        """标记文件为已解析"""
+        d = self.materials_dir / subject
+        d.mkdir(parents=True, exist_ok=True)
+        tracker_path = d / ".parsed_tracker"
+        existing = set()
+        if tracker_path.exists():
+            existing = set(tracker_path.read_text(encoding="utf-8").strip().split("\n"))
+        existing.update(filenames)
+        tracker_path.write_text("\n".join(sorted(existing)), encoding="utf-8")
 
     # ========== 题库管理 ==========
 
